@@ -15,12 +15,20 @@ struct GestureCamApp: App {
 
 struct ContentView: View {
     @StateObject private var controller = FrontGestureBackCaptureController()
-
+    
     var body: some View {
         ZStack {
+            // ✅ Live camera feed
             CameraPreview(session: controller.session)
                 .ignoresSafeArea()
-
+            
+            // ✅ Overlay dots/lines for each finger joint
+            HandSkeletonOverlay(joints: controller.overlayJoints,
+                                isMirrored: controller.overlayIsMirrored)
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            
+            // Your existing status UI (unchanged)
             VStack {
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
@@ -37,11 +45,11 @@ struct ContentView: View {
                     .padding(10)
                     .background(.ultraThinMaterial)
                     .cornerRadius(12)
-
+                    
                     Spacer()
                 }
                 .padding()
-
+                
                 Spacer()
             }
         }
@@ -52,7 +60,7 @@ struct ContentView: View {
 
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
-
+    
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         let layer = AVCaptureVideoPreviewLayer(session: session)
@@ -60,11 +68,77 @@ struct CameraPreview: UIViewRepresentable {
         view.layer.addSublayer(layer)
         return view
     }
-
+    
     func updateUIView(_ uiView: UIView, context: Context) {
         guard let layer = uiView.layer.sublayers?.first as? AVCaptureVideoPreviewLayer else { return }
         layer.session = session
         layer.frame = uiView.bounds
+    }
+}
+
+// MARK: - Hand skeleton overlay (dots for each finger joint)
+struct HandSkeletonOverlay: View {
+    /// Normalized (0...1) joint points from Vision
+    let joints: [VNHumanHandPoseObservation.JointName: CGPoint]
+    let isMirrored: Bool
+    
+    // Skeleton connections: Wrist -> each finger chain
+    private let chains: [[VNHumanHandPoseObservation.JointName]] = [
+        [.wrist, .thumbCMC, .thumbMP, .thumbIP, .thumbTip],
+        [.wrist, .indexMCP, .indexPIP, .indexDIP, .indexTip],
+        [.wrist, .middleMCP, .middlePIP, .middleDIP, .middleTip],
+        [.wrist, .ringMCP, .ringPIP, .ringDIP, .ringTip],
+        [.wrist, .littleMCP, .littlePIP, .littleDIP, .littleTip]
+    ]
+    
+    var body: some View {
+        GeometryReader { _ in
+            Canvas { ctx, size in
+                guard !joints.isEmpty else { return }
+                
+                func toView(_ p: CGPoint) -> CGPoint {
+                    // Vision points are in normalized image space; flip to SwiftUI coords
+                    let x = isMirrored ? (1.0 - p.x) : p.x
+                    let y = 1.0 - p.y
+                    return CGPoint(x: x * size.width, y: y * size.height)
+                }
+                
+                // Draw finger lines
+                for chain in chains {
+                    for i in 0..<(chain.count - 1) {
+                        let a = chain[i]
+                        let b = chain[i + 1]
+                        guard let paN = joints[a], let pbN = joints[b] else { continue }
+                        
+                        let pa = toView(paN)
+                        let pb = toView(pbN)
+                        
+                        var path = Path()
+                        path.move(to: pa)
+                        path.addLine(to: pb)
+                        ctx.stroke(path, with: .color(.white.opacity(0.75)), lineWidth: 2)
+                    }
+                }
+                
+                // Draw dots for every joint we have
+                for (_, pN) in joints {
+                    let p = toView(pN)
+                    let r: CGFloat = 6
+                    let rect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
+                    ctx.fill(Path(ellipseIn: rect), with: .color(.white))
+                    ctx.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.35)), lineWidth: 1)
+                }
+                
+                // Make wrist a little bigger if present
+                if let wristN = joints[.wrist] {
+                    let p = toView(wristN)
+                    let r: CGFloat = 9
+                    let rect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
+                    ctx.fill(Path(ellipseIn: rect), with: .color(.white))
+                    ctx.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.35)), lineWidth: 1.5)
+                }
+            }
+        }
     }
 }
 
@@ -75,32 +149,36 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let photoOutput = AVCapturePhotoOutput()
     private let videoQueue = DispatchQueue(label: "front.video.queue")
-
+    
     // State
     @Published var statusText: String = "Starting…"
     @Published var lastSavedMessage: String = ""
-
+    
+    // ✅ Overlay data (per-joint dots)
+    @Published var overlayJoints: [VNHumanHandPoseObservation.JointName: CGPoint] = [:]
+    @Published var overlayIsMirrored: Bool = true
+    
     private var currentPosition: AVCaptureDevice.Position = .front
     private var isReconfiguring = false
-
+    
     // Gesture tracking
     private var lastPinchState = false
     private var tapCount = 0
     private var firstTapTime: CFTimeInterval = 0
     private var lastTriggerTime: CFTimeInterval = 0
-
+    
     // Tune these
     private let pinchThreshold: CGFloat = 0.06
     private let tapWindow: CFTimeInterval = 1.0
     private let triggerCooldown: CFTimeInterval = 2.0
-
+    
     // Vision
     private let handPoseRequest: VNDetectHumanHandPoseRequest = {
         let r = VNDetectHumanHandPoseRequest()
         r.maximumHandCount = 1
         return r
     }()
-
+    
     func start() {
         Task {
             await requestPermissions()
@@ -109,28 +187,25 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
             statusText = "Front cam: looking for gesture…"
         }
     }
-
+    
     func stop() {
         session.stopRunning()
     }
-
+    
     private func requestPermissions() async {
-        // Photos Add permission
         let s = PHPhotoLibrary.authorizationStatus(for: .addOnly)
         if s == .notDetermined {
             _ = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         }
-        // Camera permission will be requested automatically when session starts
     }
-
+    
     private func configureSession(position: AVCaptureDevice.Position, enableGestureDetection: Bool) {
         session.beginConfiguration()
         session.sessionPreset = .photo
-
-        // Clear existing
+        
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
-
+        
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input)
@@ -140,20 +215,18 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
             return
         }
         session.addInput(input)
-
-        // Photo output always on (so we can capture on back)
+        
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
         }
-
-        // Video output only when we want gesture detection (front)
+        
         if enableGestureDetection {
             videoOutput.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
             ]
             videoOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.setSampleBufferDelegate(self, queue: videoQueue)
-
+            
             if session.canAddOutput(videoOutput) {
                 session.addOutput(videoOutput)
             }
@@ -161,49 +234,49 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
                 conn.videoOrientation = .portrait
             }
         }
-
-        // Orientation for photo connection
+        
         if let photoConn = photoOutput.connection(with: .video) {
             photoConn.videoOrientation = .portrait
         }
-
+        
         currentPosition = position
+        overlayIsMirrored = (position == .front)
         session.commitConfiguration()
     }
-
+    
     private func triggerBackCapture() {
         let now = CACurrentMediaTime()
         guard now - lastTriggerTime > triggerCooldown else { return }
         lastTriggerTime = now
-
+        
         guard !isReconfiguring else { return }
         isReconfiguring = true
-
+        
         Task { @MainActor in
             statusText = "Switching to back camera…"
             lastSavedMessage = ""
+            overlayJoints = [:]
         }
-
-        // Switch to back cam, capture, then switch back
+        
         DispatchQueue.main.async {
             self.session.stopRunning()
             self.configureSession(position: .back, enableGestureDetection: false)
             self.session.startRunning()
-
+            
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 self.capturePhoto()
             }
         }
     }
-
+    
     private func capturePhoto() {
         Task { @MainActor in self.statusText = "Capturing… (back camera)" }
-
+        
         let settings = AVCapturePhotoSettings()
         settings.flashMode = .off
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
-
+    
     private func switchBackToFrontAfterCapture() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             self.session.stopRunning()
@@ -215,7 +288,7 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
             }
         }
     }
-
+    
     private func resetTap() {
         tapCount = 0
         firstTapTime = 0
@@ -223,77 +296,100 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Front camera frames -> gesture detection
+// MARK: - Front camera frames -> gesture detection + overlay joints
 extension FrontGestureBackCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-
-        // Only detect gesture on front cam mode
+        
         guard currentPosition == .front, !isReconfiguring else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-        // Front camera orientation
+        
+        // Front camera image orientation
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
                                             orientation: .leftMirrored,
                                             options: [:])
+        
         do {
             try handler.perform([handPoseRequest])
+            
             guard let obs = handPoseRequest.results?.first else {
-                Task { @MainActor in self.statusText = "Front cam: no hand…" }
+                Task { @MainActor in
+                    self.statusText = "Front cam: no hand…"
+                    self.overlayJoints = [:]
+                }
                 resetTap()
                 return
             }
-
+            
+            // Grab the points we want (all finger joints + wrist)
+            let jointNames: [VNHumanHandPoseObservation.JointName] = [
+                .wrist,
+                
+                    .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
+                .indexMCP, .indexPIP, .indexDIP, .indexTip,
+                .middleMCP, .middlePIP, .middleDIP, .middleTip,
+                .ringMCP, .ringPIP, .ringDIP, .ringTip,
+                .littleMCP, .littlePIP, .littleDIP, .littleTip
+            ]
+            
+            var j: [VNHumanHandPoseObservation.JointName: CGPoint] = [:]
+            for name in jointNames {
+                if let p = try? obs.recognizedPoint(name), p.confidence > 0.35 {
+                    j[name] = p.location
+                }
+            }
+            
+            // Your existing gesture points
             let thumb = try obs.recognizedPoint(.thumbTip)
             let index = try obs.recognizedPoint(.indexTip)
             let wrist = try obs.recognizedPoint(.wrist)
             let middle = try obs.recognizedPoint(.middleTip)
             let ring = try obs.recognizedPoint(.ringTip)
             let little = try obs.recognizedPoint(.littleTip)
-
+            
             guard thumb.confidence > 0.5, index.confidence > 0.5, wrist.confidence > 0.2 else {
                 return
             }
-
+            
             let pinchDist = hypot(thumb.location.x - index.location.x,
-                                 thumb.location.y - index.location.y)
+                                  thumb.location.y - index.location.y)
             let isPinching = pinchDist < pinchThreshold
             let isFist = fistHeuristic(wrist: wrist, tips: [middle, ring, little]) > 0
-
+            
             Task { @MainActor in
                 self.statusText = "Front: Fist \(isFist ? "✅" : "—")  Pinch \(isPinching ? "✅" : "—")"
+                self.overlayIsMirrored = true
+                self.overlayJoints = j
             }
-
+            
             processTap(isFist: isFist, isPinching: isPinching)
         } catch {
             // ignore per-frame failures
         }
     }
-
+    
     private func fistHeuristic(wrist: VNRecognizedPoint, tips: [VNRecognizedPoint]) -> CGFloat {
         let confident = tips.filter { $0.confidence > 0.3 }
         guard confident.count >= 2 else { return -1 }
-
+        
         let dists = confident.map { hypot($0.location.x - wrist.location.x,
-                                         $0.location.y - wrist.location.y) }
+                                          $0.location.y - wrist.location.y) }
         let avg = dists.reduce(0, +) / CGFloat(dists.count)
         let spread = (dists.max() ?? avg) - (dists.min() ?? avg)
-
-        // Tune for your lighting/distance
+        
         return (avg < 0.28 && spread < 0.10) ? 1 : -1
     }
-
+    
     private func processTap(isFist: Bool, isPinching: Bool) {
         let now = CACurrentMediaTime()
-
+        
         if !isFist {
             resetTap()
             lastPinchState = isPinching
             return
         }
-
-        // Rising edge pinch counts as a "tap"
+        
         if isPinching && !lastPinchState {
             if tapCount == 0 {
                 firstTapTime = now
@@ -306,18 +402,17 @@ extension FrontGestureBackCaptureController: AVCaptureVideoDataOutputSampleBuffe
                     tapCount = 1
                 }
             }
-
+            
             if tapCount >= 2 {
                 resetTap()
                 triggerBackCapture()
             }
         }
-
-        // Window expired
+        
         if tapCount > 0 && now - firstTapTime > tapWindow {
             resetTap()
         }
-
+        
         lastPinchState = isPinching
     }
 }
@@ -327,7 +422,7 @@ extension FrontGestureBackCaptureController: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
-
+        
         if let error {
             Task { @MainActor in
                 self.statusText = "Capture error: \(error.localizedDescription)"
@@ -336,7 +431,7 @@ extension FrontGestureBackCaptureController: AVCapturePhotoCaptureDelegate {
             switchBackToFrontAfterCapture()
             return
         }
-
+        
         guard let data = photo.fileDataRepresentation(),
               let image = UIImage(data: data) else {
             Task { @MainActor in
@@ -346,7 +441,7 @@ extension FrontGestureBackCaptureController: AVCapturePhotoCaptureDelegate {
             switchBackToFrontAfterCapture()
             return
         }
-
+        
         PHPhotoLibrary.shared().performChanges({
             PHAssetChangeRequest.creationRequestForAsset(from: image)
         }, completionHandler: { success, err in
