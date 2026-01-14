@@ -28,7 +28,7 @@ struct ContentView: View {
             .ignoresSafeArea()
             .allowsHitTesting(false)
             
-            // Your existing status UI (unchanged)
+            // Status UI
             VStack {
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
@@ -120,13 +120,19 @@ struct HandSkeletonOverlay: View {
                     }
                 }
                 
+                // ✅ Dots with thicker outlines + high-contrast color (not skin tone)
+                let dotFill = Color.cyan.opacity(0.95)
+                let dotStroke = Color.black.opacity(0.75)
+                
                 // Draw dots for every joint we have
                 for (_, pN) in joints {
                     let p = toView(pN)
                     let r: CGFloat = 6
                     let rect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
-                    ctx.fill(Path(ellipseIn: rect), with: .color(.white))
-                    ctx.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.35)), lineWidth: 1)
+                    let circle = Path(ellipseIn: rect)
+                    
+                    ctx.fill(circle, with: .color(dotFill))
+                    ctx.stroke(circle, with: .color(dotStroke), lineWidth: 2.5)
                 }
                 
                 // Make wrist a little bigger if present
@@ -134,8 +140,10 @@ struct HandSkeletonOverlay: View {
                     let p = toView(wristN)
                     let r: CGFloat = 9
                     let rect = CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
-                    ctx.fill(Path(ellipseIn: rect), with: .color(.white))
-                    ctx.stroke(Path(ellipseIn: rect), with: .color(.black.opacity(0.35)), lineWidth: 1.5)
+                    let circle = Path(ellipseIn: rect)
+                    
+                    ctx.fill(circle, with: .color(dotFill))
+                    ctx.stroke(circle, with: .color(dotStroke), lineWidth: 3.0)
                 }
             }
         }
@@ -154,7 +162,7 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
     @Published var statusText: String = "Starting…"
     @Published var lastSavedMessage: String = ""
     
-    // ✅ Overlay data (per-joint dots)
+    // Overlay data (per-joint dots)
     @Published var overlayJoints: [VNHumanHandPoseObservation.JointName: CGPoint] = [:]
     @Published var overlayIsMirrored: Bool = true
     
@@ -199,6 +207,33 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
         }
     }
     
+    // ✅ ONLY used for the BACK CAMERA photo orientation
+    private func deviceToVideoOrientation() -> AVCaptureVideoOrientation {
+        switch UIDevice.current.orientation {
+        case .portrait:
+            return .portrait
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
+        case .landscapeLeft:
+            // Home indicator on the RIGHT
+            return .landscapeRight
+        case .landscapeRight:
+            // Home indicator on the LEFT
+            return .landscapeLeft
+        default:
+            // If faceUp/faceDown/unknown, default to portrait
+            return .portrait
+        }
+    }
+    
+    private func applyBackPhotoOrientationNow() {
+        guard currentPosition == .back else { return }
+        let o = deviceToVideoOrientation()
+        if let photoConn = photoOutput.connection(with: .video), photoConn.isVideoOrientationSupported {
+            photoConn.videoOrientation = o
+        }
+    }
+    
     private func configureSession(position: AVCaptureDevice.Position, enableGestureDetection: Bool) {
         session.beginConfiguration()
         session.sessionPreset = .photo
@@ -230,11 +265,13 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
             if session.canAddOutput(videoOutput) {
                 session.addOutput(videoOutput)
             }
+            // ✅ Keep front gesture pipeline exactly as before
             if let conn = videoOutput.connection(with: .video) {
                 conn.videoOrientation = .portrait
             }
         }
         
+        // ✅ Keep default as portrait (same as your working baseline)
         if let photoConn = photoOutput.connection(with: .video) {
             photoConn.videoOrientation = .portrait
         }
@@ -272,6 +309,10 @@ final class FrontGestureBackCaptureController: NSObject, ObservableObject {
     private func capturePhoto() {
         Task { @MainActor in self.statusText = "Capturing… (back camera)" }
         
+        // ✅ THIS is the change you wanted:
+        // Set the BACK CAMERA photo orientation from how the iPad is currently held.
+        applyBackPhotoOrientationNow()
+        
         let settings = AVCapturePhotoSettings()
         settings.flashMode = .off
         photoOutput.capturePhoto(with: settings, delegate: self)
@@ -305,7 +346,7 @@ extension FrontGestureBackCaptureController: AVCaptureVideoDataOutputSampleBuffe
         guard currentPosition == .front, !isReconfiguring else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         
-        // Front camera image orientation
+        // Front camera image orientation (keep exactly as before)
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
                                             orientation: .leftMirrored,
                                             options: [:])
@@ -325,8 +366,7 @@ extension FrontGestureBackCaptureController: AVCaptureVideoDataOutputSampleBuffe
             // Grab the points we want (all finger joints + wrist)
             let jointNames: [VNHumanHandPoseObservation.JointName] = [
                 .wrist,
-                
-                    .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
+                .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
                 .indexMCP, .indexPIP, .indexDIP, .indexTip,
                 .middleMCP, .middlePIP, .middleDIP, .middleTip,
                 .ringMCP, .ringPIP, .ringDIP, .ringTip,
@@ -390,6 +430,7 @@ extension FrontGestureBackCaptureController: AVCaptureVideoDataOutputSampleBuffe
             return
         }
         
+        // Rising edge pinch counts as a "tap"
         if isPinching && !lastPinchState {
             if tapCount == 0 {
                 firstTapTime = now
@@ -409,6 +450,7 @@ extension FrontGestureBackCaptureController: AVCaptureVideoDataOutputSampleBuffe
             }
         }
         
+        // Window expired
         if tapCount > 0 && now - firstTapTime > tapWindow {
             resetTap()
         }
