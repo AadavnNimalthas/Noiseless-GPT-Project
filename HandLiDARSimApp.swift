@@ -213,7 +213,7 @@ final class Coordinator: NSObject, ARSessionDelegate {
             
             // Unproject to camera space
             let x = (u - cx) / fx * z
-            let y = (v - cy) / fy * z
+            let y = -(v - cy) / fy * z   // flip vertical
             out[jn] = SIMD3<Float>(x, y, z)
         }
         
@@ -439,7 +439,7 @@ final class DepthCloudRenderer {
                 
                 // Unproject
                 let x = (u - cx) / fx * z
-                let y = (v - cy) / fy * z
+                let y = -(v - cy) / fy * z   // flip vertical
                 
                 let e = points[idx]
                 e.isEnabled = true
