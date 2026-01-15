@@ -17,20 +17,43 @@ struct HandLiDARSimApp: App {
 }
 
 struct HandLiDARSimView: View {
+    @State private var showCameraFeed: Bool = true
+    @State private var showSkeleton: Bool = true
+    
     var body: some View {
-        ARContainerView()
+        ZStack(alignment: .topLeading) {
+            ARContainerView(showCameraFeed: $showCameraFeed,
+                            showSkeleton: $showSkeleton)
             .ignoresSafeArea()
+            
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("Show camera", isOn: $showCameraFeed)
+                    .toggleStyle(.switch)
+                
+                Toggle("Show skeleton", isOn: $showSkeleton)
+                    .toggleStyle(.switch)
+            }
+            .padding(12)
+            .background(.ultraThinMaterial)
+            .cornerRadius(12)
+            .padding()
+        }
     }
 }
 
 // MARK: - SwiftUI + RealityKit container
 struct ARContainerView: UIViewRepresentable {
+    @Binding var showCameraFeed: Bool
+    @Binding var showSkeleton: Bool
+    
     func makeCoordinator() -> Coordinator { Coordinator() }
     
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
         arView.automaticallyConfigureSession = false
-        arView.environment.background = .cameraFeed()
+        
+        // Background starts based on toggle
+        arView.environment.background = showCameraFeed ? .cameraFeed() : .color(.black)
         
         let config = ARWorldTrackingConfiguration()
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
@@ -41,11 +64,20 @@ struct ARContainerView: UIViewRepresentable {
         arView.session.delegate = context.coordinator
         context.coordinator.attach(to: arView)
         
+        // Initial toggle states
+        context.coordinator.setSkeletonEnabled(showSkeleton)
+        
         arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         return arView
     }
     
-    func updateUIView(_ uiView: ARView, context: Context) {}
+    func updateUIView(_ arView: ARView, context: Context) {
+        // Toggle camera feed on/off
+        arView.environment.background = showCameraFeed ? .cameraFeed() : .color(.black)
+        
+        // Toggle skeleton on/off
+        context.coordinator.setSkeletonEnabled(showSkeleton)
+    }
 }
 
 // MARK: - Coordinator (ARSessionDelegate + Vision + Rendering)
@@ -54,7 +86,7 @@ final class Coordinator: NSObject, ARSessionDelegate {
     private let cameraAnchor = AnchorEntity(.camera)
     
     private let skeleton = HandSkeletonRenderer()
-    private let cloud = DepthCloudRenderer(maxPoints: 1200) // ✅ denser "hand surface" feel
+    private let cloud = DepthCloudRenderer(maxPoints: 1200) // denser "hand surface" feel
     
     private let handPoseRequest: VNDetectHumanHandPoseRequest = {
         let r = VNDetectHumanHandPoseRequest()
@@ -65,9 +97,17 @@ final class Coordinator: NSObject, ARSessionDelegate {
     private var lastVisionTime: TimeInterval = 0
     private let visionInterval: TimeInterval = 1.0 / 15.0 // 15 Hz
     
-    // ✅ Smoothing state
+    // Smoothing state
     private var smoothedJoints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
-    private let smoothing: Float = 0.80 // 0.70–0.88 feels good
+    private let smoothing: Float = 0.80
+    
+    // ✅ User toggle state (toggle should "win")
+    private var userSkeletonEnabled: Bool = true
+    
+    func setSkeletonEnabled(_ enabled: Bool) {
+        userSkeletonEnabled = enabled
+        skeleton.setVisible(enabled)
+    }
     
     func attach(to view: ARView) {
         self.arView = view
@@ -82,7 +122,7 @@ final class Coordinator: NSObject, ARSessionDelegate {
         lastVisionTime = t
         
         guard let sceneDepth = frame.sceneDepth else {
-            skeleton.setVisible(false)
+            skeleton.setVisible(false)  // no depth -> hide
             cloud.setVisible(false)
             return
         }
@@ -99,7 +139,7 @@ final class Coordinator: NSObject, ARSessionDelegate {
         do {
             try handler.perform([handPoseRequest])
             guard let obs = handPoseRequest.results?.first else {
-                skeleton.setVisible(false)
+                skeleton.setVisible(false)  // no hand -> hide regardless of toggle
                 cloud.setVisible(false)
                 return
             }
@@ -143,12 +183,16 @@ final class Coordinator: NSObject, ARSessionDelegate {
                 return
             }
             
-            // ✅ Smooth the 3D joints (huge visual improvement)
+            // Smooth the 3D joints
             let stable = smoothJoints(joints3D)
             
-            skeleton.setVisible(true)
-            skeleton.update(joints3D: stable)
+            // ✅ Toggle wins: only show if user enabled
+            skeleton.setVisible(userSkeletonEnabled)
+            if userSkeletonEnabled {
+                skeleton.update(joints3D: stable)
+            }
             
+            // Keep mist as before
             cloud.setVisible(true)
             cloud.updateAroundHand(joints2D: joints2D,
                                    depthMap: depthMap,
@@ -156,11 +200,11 @@ final class Coordinator: NSObject, ARSessionDelegate {
                                    imageResolution: imageRes,
                                    intrinsics: intr)
         } catch {
-            // keep AR smooth; ignore per-frame failures
+            // ignore per-frame failures
         }
     }
     
-    // ✅ Exponential smoothing in 3D
+    // Exponential smoothing in 3D
     private func smoothJoints(_ new: [VNHumanHandPoseObservation.JointName: SIMD3<Float>])
     -> [VNHumanHandPoseObservation.JointName: SIMD3<Float>] {
         
@@ -228,22 +272,17 @@ final class Coordinator: NSObject, ARSessionDelegate {
     
     private static func cgImageOrientationForCurrentDevice() -> CGImagePropertyOrientation {
         switch UIDevice.current.orientation {
-        case .landscapeLeft:
-            return .up
-        case .landscapeRight:
-            return .down
-        case .portraitUpsideDown:
-            return .left
-        default:
-            return .right
+        case .landscapeLeft: return .up
+        case .landscapeRight: return .down
+        case .portraitUpsideDown: return .left
+        default: return .right
         }
     }
 }
 
-// MARK: - Hand skeleton renderer (NO spheres, just smoother “bones”)
+// MARK: - Hand skeleton renderer (bones only)
 final class HandSkeletonRenderer {
     let root = Entity()
-    
     private var boneEntities: [String: ModelEntity] = [:]
     
     private let chains: [[VNHumanHandPoseObservation.JointName]] = [
@@ -254,7 +293,6 @@ final class HandSkeletonRenderer {
         [.wrist, .littleMCP, .littlePIP, .littleDIP, .littleTip]
     ]
     
-    // Slightly darker + smoother look
     private let boneMat = SimpleMaterial(color: .init(white: 0.58, alpha: 0.95),
                                          roughness: 0.35,
                                          isMetallic: false)
@@ -275,7 +313,6 @@ final class HandSkeletonRenderer {
                 boneEntities[key] = bone
                 if bone.parent == nil { root.addChild(bone) }
                 
-                // camera-local: put in front with negative z
                 placeCylinder(bone,
                               from: SIMD3<Float>(pa.x, pa.y, -pa.z),
                               to:   SIMD3<Float>(pb.x, pb.y, -pb.z))
@@ -284,7 +321,6 @@ final class HandSkeletonRenderer {
     }
     
     private func makeBoneCylinder() -> ModelEntity {
-        // Thicker than before so it reads like a hand surface
         let mesh = MeshResource.generateCylinder(height: 1.0, radius: 0.010)
         return ModelEntity(mesh: mesh, materials: [boneMat])
     }
@@ -308,19 +344,17 @@ final class HandSkeletonRenderer {
             e.orientation = simd_quatf(angle: angle, axis: simd_normalize(axis))
         }
         
-        // Slight taper feel: thicker on longer bones
         let thickness: Float = (len > 0.045) ? 1.15 : 0.95
         e.scale = SIMD3<Float>(thickness, len, thickness)
     }
 }
 
-// MARK: - Depth cloud renderer (denser "skin/mist" around hand)
+// MARK: - Depth cloud renderer
 final class DepthCloudRenderer {
     let root = Entity()
     private var points: [ModelEntity] = []
     private let maxPoints: Int
     
-    // slightly translucent so it feels like volume
     private let mat = SimpleMaterial(color: .init(white: 0.75, alpha: 0.65),
                                      roughness: 1.0,
                                      isMetallic: false)
@@ -329,7 +363,6 @@ final class DepthCloudRenderer {
         self.maxPoints = maxPoints
         points.reserveCapacity(maxPoints)
         
-        // Smaller dots, many more of them
         for _ in 0..<maxPoints {
             let e = ModelEntity(mesh: .generateSphere(radius: 0.0028), materials: [mat])
             e.isEnabled = false
@@ -341,7 +374,7 @@ final class DepthCloudRenderer {
     func setVisible(_ visible: Bool) {
         root.isEnabled = visible
     }
-     
+    
     func updateAroundHand(
         joints2D: [VNHumanHandPoseObservation.JointName: CGPoint],
         depthMap: CVPixelBuffer,
@@ -396,7 +429,6 @@ final class DepthCloudRenderer {
         let cx = intrinsics.columns.2.x
         let cy = intrinsics.columns.2.y
         
-        // ✅ Denser grid for "surface feel"
         let stepsX = 40
         let stepsY = 30
         
