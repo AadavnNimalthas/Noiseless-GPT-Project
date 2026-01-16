@@ -280,10 +280,13 @@ final class Coordinator: NSObject, ARSessionDelegate {
     }
 }
 
-// MARK: - Hand skeleton renderer (bones only)
+// MARK: - Hand skeleton renderer (bones + simple palm square)
 final class HandSkeletonRenderer {
     let root = Entity()
     private var boneEntities: [String: ModelEntity] = [:]
+    
+    // ✅ Palm quad entity (a flat square for now)
+    private var palmEntity: ModelEntity?
     
     private let chains: [[VNHumanHandPoseObservation.JointName]] = [
         [.wrist, .thumbCMC, .thumbMP, .thumbIP, .thumbTip],
@@ -297,11 +300,17 @@ final class HandSkeletonRenderer {
                                          roughness: 0.35,
                                          isMetallic: false)
     
+    // ✅ Slightly different palm material so it reads as a surface
+    private let palmMat = SimpleMaterial(color: .init(white: 0.62, alpha: 0.55),
+                                         roughness: 0.65,
+                                         isMetallic: false)
+    
     func setVisible(_ visible: Bool) {
         root.isEnabled = visible
     }
     
     func update(joints3D: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]) {
+        // 1) Bones (same as before)
         for chain in chains {
             for i in 0..<(chain.count - 1) {
                 let a = chain[i]
@@ -318,6 +327,9 @@ final class HandSkeletonRenderer {
                               to:   SIMD3<Float>(pb.x, pb.y, -pb.z))
             }
         }
+        
+        // 2) ✅ Palm square (wrist + MCPs)
+        updatePalm(joints3D: joints3D)
     }
     
     private func makeBoneCylinder() -> ModelEntity {
@@ -346,6 +358,52 @@ final class HandSkeletonRenderer {
         
         let thickness: Float = (len > 0.045) ? 1.15 : 0.95
         e.scale = SIMD3<Float>(thickness, len, thickness)
+    }
+    
+    // MARK: - Palm square
+    
+    /// Builds a simple quad for the palm using 4 joints:
+    /// wrist, indexMCP, littleMCP, thumbCMC
+    private func updatePalm(joints3D: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]) {
+        guard
+            let wrist = joints3D[.wrist],
+            let indexMCP = joints3D[.indexMCP],
+            let littleMCP = joints3D[.littleMCP],
+            let thumbCMC = joints3D[.thumbCMC]
+        else {
+            palmEntity?.isEnabled = false
+            return
+        }
+        
+        // Convert to camera-local coords (negative z forward)
+        let w = SIMD3<Float>(wrist.x, wrist.y, -wrist.z)
+        let i = SIMD3<Float>(indexMCP.x, indexMCP.y, -indexMCP.z)
+        let l = SIMD3<Float>(littleMCP.x, littleMCP.y, -littleMCP.z)
+        let t = SIMD3<Float>(thumbCMC.x, thumbCMC.y, -thumbCMC.z)
+        
+        // Quad corners: [thumbCMC, indexMCP, littleMCP, wrist]
+        // (Order matters for the face normal)
+        let positions: [SIMD3<Float>] = [t, i, l, w]
+        
+        // If palm doesn't exist yet, create it once
+        if palmEntity == nil {
+            palmEntity = ModelEntity(mesh: makePalmMesh(positions: positions),
+                                     materials: [palmMat])
+            if let palmEntity { root.addChild(palmEntity) }
+        } else {
+            // Update mesh every frame
+            palmEntity?.model?.mesh = makePalmMesh(positions: positions)
+        }
+        
+        palmEntity?.isEnabled = true
+    }
+    
+    private func makePalmMesh(positions p: [SIMD3<Float>]) -> MeshResource {
+        // 4 vertices, two triangles: (0,1,2) and (0,2,3)
+        var desc = MeshDescriptor()
+        desc.positions = MeshBuffers.Positions(p)
+        desc.primitives = .triangles([0, 1, 2, 0, 2, 3])
+        return try! MeshResource.generate(from: [desc])
     }
 }
 
